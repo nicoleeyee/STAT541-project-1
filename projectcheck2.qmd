@@ -62,6 +62,11 @@ library(janitor)
 library(gt)
 #install.packages("xfun")
 library(xfun)
+library(httr)
+library(tidyjson)
+library(jsonlite)
+library(rvest)
+library(chromote)
 
 cases_month <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/main/data/2025/2025-06-24/cases_month.csv') |>
   clean_names()
@@ -364,3 +369,333 @@ measles_region_patterns |>
     locations = cells_column_labels()
   ) 
 ```
+
+## Project Checkpoint 3
+
+### Acquire new country-level data source using webscraping: GDP per capita
+
+```{r}
+#| warning: false
+#| message: false
+
+# function to scrape one year of gdp data
+scrape_gdp_year <- function(year) {
+  
+  # create url for a specific year
+  url <- paste0(
+    "https://ourworldindata.org/grapher/gdp-per-capita-worldbank",
+    "?tab=table&time=", year, "..", year,
+    "&tableFilter=countries"
+  )
+  
+  # open browser session: page is dynamic (live)
+  b <- ChromoteSession$new()
+  
+  # browser closes after function
+  on.exit(try(b$close(), silent = TRUE), add = TRUE)
+  
+  # go to page
+  b$Page$navigate(url)
+  
+  # wait for loaded table
+  Sys.sleep(5)
+  
+  # get rendered html from the page
+  eval_result <- b$Runtime$evaluate("document.documentElement.outerHTML")
+  rendered_html <- eval_result$result$value
+  
+  # read html into r
+  page <- read_html(rendered_html)
+  
+  # extract the table from the page
+  tab <- page |>
+    html_element("table") |>
+    html_table()
+  
+  # keep only country and gdp
+  tab_clean <- tab[, 1:2]
+  names(tab_clean) <- c("country", "gdp_per_capita")
+  
+  # clean the data
+  tab_clean <- tab_clean |>
+    mutate(
+      scraped_year = year, # year                              
+      gdp_per_capita = str_remove_all(gdp_per_capita, "\\$|,"), # remove $ and ,
+      gdp_per_capita = na_if(gdp_per_capita, ""), # empty is NA
+      gdp_per_capita = as.numeric(gdp_per_capita) # convert to numeric
+    ) |>
+    filter(country != "Country or region") |>
+    filter(!is.na(country))
+  tab_clean
+}
+
+# create vector of years to scrape
+years <- 2012:2024
+
+# loop over all years, then combine
+gdp_web <- map_dfr(years, scrape_gdp_year)
+head(gdp_web)
+```
+
+### Acquire new country-level data source using API (Checking webscraping result): GDP per capita
+
+```{r}
+# url for owid gdp data
+gdp_url <- "https://ourworldindata.org/grapher/gdp-per-capita-worldbank.csv?v=1&csvType=full&useColumnShortNames=false"
+
+# send request to API
+response <- GET(gdp_url)
+
+# check status
+#status_code(response)
+
+# extract content
+gdp_raw <- content(response, as = "text", encoding = "UTF-8")
+
+# read the csv text into a DF
+gdp_api <- read_csv(gdp_raw, 
+                    show_col_types = FALSE) |>
+  # keep years 2012 to 2024
+  filter(Year >= 2012, Year <= 2024)
+
+head(gdp_api)
+```
+
+#### Data Context: GDP per capita
+
+This dataset contains country-level GDP per capita data, where the observations are countries and regions around the world. The data includes over 200 countries' GDP, and ranges from 1990 to 2024, and our Measles project focuses on the years 2012 through 2024. GDP per capita is calculated by dividing a country’s total output by its population and adjusting values with the same international dollars to take into account inflation and living cost differences. The goal of this data is to compare economic performance, living conditions, and economic growth across almost all countries over many years. The data is created by organizations such as the World Bank, IMF, OECD, and Eurostat, and is summarized by Our World in Data. GDP data is collected by national statistical agencies using censuses, surveys, and tax or government data, and then analyzed and organized by the World Bank, IMF, etc.
+
+### Acquire new country-level data source using API: Population density
+
+We are using the API Ninjas API for country populations. To use this API, we had to create an account and request and API key. In the code below we used a placeholder for our API key.
+
+```{r}
+#| echo: false
+key <- "UYXpEczDLUuMq77FT9BYvludLdZ5SlfVe2rJAz1W"
+```
+
+```{r}
+#| message: false
+
+cases_year <- cases_year |>
+  # recode country names that are not recognized by the API
+  mutate(country_api = recode_values(
+    country,
+    "Côte d'Ivoire" ~ "Cote d'Ivoire",
+    "Bolivia (Plurinational State of)" ~ "Bolivia",
+    "Venezuela (Bolivarian Republic of)" ~ "Venezuela",
+    "Iran (Islamic Republic of)" ~ "Iran",
+    "Netherlands (Kingdom of the)" ~ "Netherlands",
+    "Micronesia (Federated States of)" ~ "Micronesia",
+    default = country
+  ),
+  # add %20 in place of spaces so the url in a request works
+    country_url = str_replace_all(country_api, " ", "%20"))
+
+# function to get population density per square kilometer each year for a country
+get_population_density <- function(country) {
+
+  # check that the country input is a string
+  if (!is.character(country)) {
+    print("Please enter a country name (string value)!")
+    stop()
+  }
+  
+  # create url string with given country
+  url <- glue::glue("https://api.api-ninjas.com/v1/population?country={country}")
+  
+  # request from the API
+  densities <- GET(url, 
+    # API key is in a hidden code chunk
+    add_headers("X-Api-Key"={key})) %>%
+    # pull and process output
+    .$content %>%
+    rawToChar() |>
+    # enter population statistics (contains density!)
+    enter_object(historical_population) |>
+    gather_array() |>
+    # cannot use spread_all because some countries have NA for columns
+    spread_values(
+      # jnumber makes it numeric, otherwise it throws an error
+      year = jnumber(year),
+      density = jnumber(density))
+  
+  # check if no output (API does not have data for a country)
+  if (NROW(densities) == 0) {
+    NULL
+  } else {
+    # otherwise return a df of the densities, year, and country name
+    densities |>
+      select(year, density) |>
+      mutate(country = str_replace_all(country, "%20", " "))
+  }
+}
+
+# iterate over all countries and get densities
+results <- map_dfr(.x = unique(cases_year$country_url),
+                   .f = get_population_density) |>
+  select(year, density, country) |>
+  # make a tibble to join later (threw an error without this)
+  as_tibble()
+
+head(results)
+```
+
+#### Data Context: Population density
+
+This dataset contains country-level population density data. It includes population density per square kilometer for countries over the years. Country population density describes the number of people per square kilometer. It is calculated by dividing the total population of a country by it's total land area. Population counts are usually collected by censuses and surveys, and population density is derived from that data. Population density is a measure of how crowded a country is. We wanted to use population density data to investigate if there is a notable relationship between density and measles case counts, since measles is highly contagious and can be airborne. This data was compiled from API Ninjas' Population API. API Ninja does not disclose where they compile their data from.
+
+### Data Joining
+
+```{r}
+# clean gdp data so country and year match the cases data
+gdp_web_clean <- gdp_web |>
+  rename(
+    country = country,
+    year = scraped_year
+  )
+# join gdp data to the yearly cases data
+cases_year_gdp <- cases_year |>
+  left_join(gdp_web_clean,
+            by = c("country", "year"))
+# join the yearly gdp/cases data to the monthly cases data
+cases_gdp <- cases_month |>
+  left_join(
+    cases_year_gdp,
+    by = c("country", "year"),
+    suffix = c("_month", "_year")
+  ) |>
+  # make a tibble to join (threw an error without this)
+  as_tibble() |>
+  # join densities with data by country and year
+  left_join(results, by = join_by(country == country,
+                                  year == year)) |>
+  # drop country columns formatted for the API request
+  select(!c(country_url, country_api))
+```
+
+### Data Visualizations
+
+#### GDP per capita
+
+```{r}
+#| message: false
+
+# create dataset: epi-linked cases and join average gdp across all years
+cases_gdp_country <- cases_year |>
+  
+  # remove 2025 for plotting (no gdp data)
+  filter(year != 2025) |>
+  
+  # group by country and region
+  group_by(country, region) |>
+  
+  # sum epidemiologically linked cases
+  summarise(
+    epi_linked = sum(measles_epi_linked, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  
+  # join average gdp per country
+  left_join(
+    gdp_web |>
+      group_by(country) |>
+      summarise(
+        avg_gdp_per_capita = mean(gdp_per_capita, na.rm = TRUE),
+        .groups = "drop"
+      ),
+    by = "country"
+  ) |>
+  
+  # rename regions to full names
+  mutate(
+    region = recode(region,
+      "AFRO" = "Africa",
+      "AMRO" = "Americas",
+      "EMRO" = "Eastern mediterranean",
+      "EURO" = "Europe",
+      "SEARO" = "South-east asia",
+      "WPRO" = "Western pacific"
+    )
+  ) |>
+  
+  # remove missing values and limit cases
+  filter(
+    !is.na(avg_gdp_per_capita),
+    !is.na(epi_linked),
+    epi_linked <= 20000
+  )
+
+# create plot
+ggplot(cases_gdp_country,
+       aes(x = avg_gdp_per_capita,
+           y = epi_linked,
+           color = region)) +
+  geom_point(alpha = 0.8, size = 2) +
+  # add trend line
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE, linetype = "dashed") +
+  # no scientific notation for GDP
+  scale_x_log10(labels = scales::comma) +
+  # show full numbers on y axis
+  scale_y_continuous(labels = scales::comma) +
+  # labels
+  labs(
+    title = "Epidemiologically Linked Measles Cases by GDP per capita",
+    subtitle = "GDP averaged and cases summed across 2012–2024",
+    x = "Average GDP per capita (international dollars)",
+    y = "Total epidemiologically linked measles cases",
+    color = "region"
+  ) +
+  theme_minimal()
+```
+
+This scatterplot shows the relationship between average GDP per capita and total epidemiologically linked measles cases for all countries. Each point represents one country, with average GDP and totaled case numbers from years 2012 to 2024. Countries with higher GDP per capita tend to be associated with less epidemiologically linked measles cases. Regional differences are also shown, as some countries in lower income/economy regions tend to have higher case counts.
+
+#### Population Density
+
+To break up density into bins, we find quantiles of country densities:
+
+```{r}
+quantile(cases_gdp$density, na.rm = TRUE)
+```
+
+```{r}
+#| warning: false
+#| message: false
+
+cases_gdp |>
+  # create density bins based on quantiles of country densities
+  mutate(binned_density = case_when(
+    is.na(density) ~ "NA",
+    density < 31 ~ "< 31",
+    density >= 31 & density < 79 ~ "31 - 79",
+    density >= 79 & density < 171.25~ "79 - 171.25",
+    density >= 171.25 ~ "> 171.25"
+  )) |>
+  filter(binned_density != "NA") |>
+  # take averages of cases across countries for each year, within density bins
+  group_by(year, binned_density) |>
+  summarise(measles_mean = mean(measles_total_year, na.rm = TRUE),
+            rubella_mean = mean(rubella_total_year), na.rm = TRUE) |>
+  # plot - make year a factor to show all years on the xaxis 
+  ggplot(aes(x=factor(year), 
+             y=measles_mean, 
+             color = binned_density,
+             group = binned_density)) +
+  # line plot
+  geom_path(size = 1.5) +
+  # overlay points to clarify obervations by year
+  geom_point(size = 3) +
+  # customize colors and legend
+  scale_color_manual(name = "Population Density (per sq km)",
+                     values = c("#b3cde3", "#8c96c6", "#8856a7", "#810f7c"),
+                     labels = c("< 31", "31 - 79", "79 - 171.25", "> 171.25")) +
+  theme_bw() +
+  labs(x="Year",
+       y="Measles Cases",
+       title = "Average Measles Cases by Population Density Group Over Time",
+       subtitle = "Mean number of cases across countries within \neach density group for each year") 
+
+```
+
+The visualization above shows the relationship between average number of measles cases with population density. The number of cases is averaged across countries in each population density group. Measles is a contagious airborne disease, so we wanted to investigate if there was a general relationship between number of cases and country population density. It does not appear that there is a stable relationship, since higher density countries do not have a consistently higher number of cases. This visualization suggests that population density alone is not a strong indicator of number of measles cases and other factors should be looked in to.
